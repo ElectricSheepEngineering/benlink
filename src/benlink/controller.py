@@ -315,7 +315,8 @@ class RadioController:
 
         channels: t.List[Channel] = []
 
-        for i in range(device_info.channel_count):
+        total_channels = device_info.channel_count * max(device_info.region_count, 1)
+        for i in range(total_channels):
             channel_settings = await self._conn.get_channel(i)
             channels.append(channel_settings)
 

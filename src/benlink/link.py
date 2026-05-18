@@ -2,6 +2,7 @@ from __future__ import annotations
 import typing as t
 import socket
 import asyncio
+import sys
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from . import protocol as p
@@ -40,12 +41,14 @@ RADIO_INDICATE_UUID = "00001102-d102-11e1-9b23-00025b00a5a5"
 
 class BleCommandLink:
     _client: BleakClient
+    _buffer: BitStream
 
     def is_connected(self) -> bool:
         return self._client.is_connected
 
     def __init__(self, device_uuid: str):
         self._client = BleakClient(device_uuid)
+        self._buffer = BitStream()
 
     async def send(self, msg: p.Message):
         await self.send_bytes(msg.to_bytes())
@@ -55,10 +58,29 @@ class BleCommandLink:
 
     async def connect(self, callback: t.Callable[[p.Message], None]):
         await self._client.connect()
+        self._buffer = BitStream()
 
         def on_data(characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
-            assert characteristic.uuid == RADIO_INDICATE_UUID
-            callback(p.Message.from_bytes(data))
+            _ = characteristic
+
+            if not data:
+                return
+
+            self._buffer = self._buffer.extend_bytes(data)
+
+            try:
+                messages, self._buffer = p.Message.from_bitstream_batch(self._buffer)
+            except Exception:
+                messages, self._buffer = p.Message.from_bitstream_batch(
+                    self._buffer,
+                    consume_errors=True,
+                )
+
+            for message in messages:
+                try:
+                    callback(message)
+                except Exception as exc:
+                    print(f"[benlink] callback error: {exc}", file=sys.stderr)
 
         await self._client.start_notify(RADIO_INDICATE_UUID, on_data)
 

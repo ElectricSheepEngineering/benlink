@@ -53,10 +53,13 @@ RADIO_INDICATE_UUID = "00001102-d102-11e1-9b23-00025b00a5a5"
 class CommandConnection:
     _link: CommandLink
     _handlers: t.List[RadioMessageHandler] = []
+    _reply_timeout_seconds: float
 
     def __init__(self, link: CommandLink):
         self._link = link
         self._handlers = []
+        self._reply_timeout_seconds = 60.0
+        self._settings_body_size: int = 20  # bytes; updated from READ_SETTINGS reply
 
     @classmethod
     def new_ble(cls, device_uuid: str) -> CommandConnection:
@@ -98,13 +101,19 @@ class CommandConnection:
 
         remove_handler = self._add_message_handler(reply_handler)
 
-        await self.send_message(command)
-
-        out = await queue.get()
-
-        remove_handler()
-
-        return out
+        try:
+            await self.send_message(command)
+            out = await asyncio.wait_for(
+                queue.get(),
+                timeout=self._reply_timeout_seconds,
+            )
+            return out
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Timeout waiting for {expect.__name__} reply"
+            ) from exc
+        finally:
+            remove_handler()
 
     def add_event_handler(self, handler: EventHandler) -> t.Callable[[], None]:
         def event_handler(msg: RadioMessage):
@@ -197,9 +206,37 @@ class CommandConnection:
 
     async def set_settings(self, settings: Settings) -> None:
         """Set the settings"""
-        reply = await self.send_message_expect_reply(SetSettings(settings), SetSettingsReply)
-        if isinstance(reply, MessageReplyError):
-            raise reply.as_exception()
+        # Build the full WRITE_SETTINGS message, then truncate the settings
+        # body to match the size the radio reported on READ_SETTINGS.
+        # This radio firmware (v126) sends 20 bytes (160 bits) of settings on
+        # READ, so we mirror that exact size on WRITE to avoid INVALID_PARAMETER.
+        full_msg = command_message_to_protocol(SetSettings(settings))
+        full_bytes = full_msg.to_bytes()
+        # Determine how many settings bytes the radio actually sent us on the
+        # last successful READ_SETTINGS (stored as self._settings_body_size).
+        # Fall back to 20 bytes (160 bits) for this radio firmware if unknown.
+        target_size = self._settings_body_size
+        # 4-byte message header + target_size settings bytes
+        trimmed = full_bytes[:4 + target_size]
+        queue: asyncio.Queue[SetSettingsReply | MessageReplyError] = asyncio.Queue()
+
+        def reply_handler(reply: RadioMessage):
+            if isinstance(reply, SetSettingsReply) or (
+                isinstance(reply, MessageReplyError) and reply.message_type is SetSettingsReply
+            ):
+                queue.put_nowait(reply)
+
+        remove_handler = self._add_message_handler(reply_handler)
+        try:
+            await self._link.send_bytes(trimmed)
+            out = await asyncio.wait_for(queue.get(), timeout=self._reply_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Timeout waiting for SetSettingsReply reply") from exc
+        finally:
+            remove_handler()
+
+        if isinstance(out, MessageReplyError):
+            raise out.as_exception()
 
     async def get_channel(self, channel_id: int) -> Channel:
         """Get a channel"""

@@ -309,8 +309,13 @@ def bftype_has_children_with_default(bftype: BFType) -> bool:
 
 def bftype_from_bitstream(bftype: BFType, stream: BitStream, proxy: AttrProxy, opts: t.Any) -> t.Tuple[t.Any, BitStream]:
     match bftype:
-        case BFBits(n=n):
-            return stream.take(n)
+        case BFBits(n=n, default=default):
+            try:
+                return stream.take(n)
+            except EOFError:
+                if is_provided(default):
+                    return default, stream
+                raise
 
         case BFList(inner=inner, n=n):
             acc: t.List[t.Any] = []
@@ -321,11 +326,16 @@ def bftype_from_bitstream(bftype: BFType, stream: BitStream, proxy: AttrProxy, o
                 acc.append(item)
             return acc, stream
 
-        case BFMap(inner=inner, vm=vm):
-            value, stream = bftype_from_bitstream(
-                inner, stream, proxy, opts
-            )
-            return vm.forward(value), stream
+        case BFMap(inner=inner, vm=vm, default=default):
+            try:
+                value, stream = bftype_from_bitstream(
+                    inner, stream, proxy, opts
+                )
+                return vm.forward(value), stream
+            except EOFError:
+                if is_provided(default):
+                    return default, stream
+                raise
 
         case BFDynSelf(fn=fn):
             return bftype_from_bitstream(undisguise(fn(proxy)), stream, proxy, opts)
@@ -345,8 +355,18 @@ def bftype_from_bitstream(bftype: BFType, stream: BitStream, proxy: AttrProxy, o
             return None, stream
 
         case BFBitfield(inner=inner, n=n):
-            bits, stream = stream.take(n)
-            return inner.from_bits(bits, opts), stream
+            available = stream.remaining()
+            if available < n:
+                # Not enough bits in stream — take what's available and let
+                # from_bitstream fill missing fields using their defaults.
+                # If any required field has no default, from_bitstream will
+                # raise EOFError and the caller will handle it normally.
+                bits, stream = stream.take(available)
+            else:
+                bits, stream = stream.take(n)
+            sub_stream = BitStream(bits)
+            result, _ = inner.from_bitstream(sub_stream, opts)
+            return result, stream
 
 
 def is_bitfield(x: t.Any) -> t.TypeGuard[Bitfield[t.Any]]:
@@ -359,7 +379,9 @@ def is_bitfield_class(x: t.Type[t.Any]) -> t.TypeGuard[t.Type[Bitfield[t.Any]]]:
 
 def bftype_to_bits(bftype: BFType, value: t.Any, proxy: AttrProxy, opts: t.Any) -> Bits:
     match bftype:
-        case BFBits(n=n):
+        case BFBits(n=n, default=default):
+            if value is NOT_PROVIDED and is_provided(default):
+                value = default
             if len(value) != n:
                 raise ValueError(f"expected {n} bits, got {len(value)}")
             return Bits(value)
@@ -369,7 +391,9 @@ def bftype_to_bits(bftype: BFType, value: t.Any, proxy: AttrProxy, opts: t.Any) 
                 raise ValueError(f"expected {n} items, got {len(value)}")
             return sum([bftype_to_bits(inner, item, proxy, opts) for item in value], Bits())
 
-        case BFMap(inner=inner, vm=vm):
+        case BFMap(inner=inner, vm=vm, default=default):
+            if value is NOT_PROVIDED and is_provided(default):
+                value = default
             return bftype_to_bits(inner, vm.back(value), proxy, opts)
 
         case BFDynSelf(fn=fn):
