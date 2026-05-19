@@ -35,10 +35,13 @@ for functions that take keyword arguments to set these parameters.
 from __future__ import annotations
 import typing as t
 import asyncio
+import logging
 from pydantic import BaseModel, ConfigDict
 from . import protocol as p
 from .link import CommandLink, BleCommandLink, RfcommCommandLink
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 RADIO_SERVICE_UUID = "00001100-d102-11e1-9b23-00025b00a5a5"
 """@private"""
@@ -81,6 +84,155 @@ class CommandConnection:
 
     async def send_bytes(self, data: bytes) -> None:
         await self._link.send_bytes(data)
+
+    async def set_volume(self, level: int) -> None:
+        """Set hardware volume using dedicated SET_VOLUME command (0-15)"""
+        if level < 0 or level > 15:
+            raise ValueError(f"Volume level must be 0-15, got {level}")
+        # Build raw message: group=BASIC(2), is_reply=0, command=SET_VOLUME(23), body=[level]
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.SET_VOLUME,
+            body=bytes([level])
+        )
+        raw = msg.to_bytes()
+        logger.debug("[SET_VOLUME] level=%d, bytes=%s", level, raw.hex())
+        await self._link.send_bytes(raw)
+
+    async def get_volume(self) -> int:
+        """Get hardware volume using dedicated GET_VOLUME command (returns 0-15)"""
+        import asyncio
+        # Build raw message: group=BASIC(2), is_reply=0, command=GET_VOLUME(22), no body
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.GET_VOLUME,
+            body=b''
+        )
+        raw = msg.to_bytes()
+
+        # Listen for the reply (raw bytes with is_reply set)
+        reply_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        def raw_handler(reply: RadioMessage):
+            # The reply will be an UnknownProtocolMessage since GET_VOLUME
+            # reply isn't implemented in the protocol layer
+            if isinstance(reply, UnknownProtocolMessage):
+                proto_msg = reply.message
+                if (proto_msg.command_group == p.CommandGroup.BASIC and
+                    proto_msg.is_reply and
+                    proto_msg.command == p.BasicCommand.GET_VOLUME):
+                    body = proto_msg.body
+                    if isinstance(body, bytes):
+                        reply_queue.put_nowait(body)
+
+        remove_handler = self._add_message_handler(raw_handler)
+        try:
+            await self._link.send_bytes(raw)
+            body = await asyncio.wait_for(reply_queue.get(), timeout=self._reply_timeout_seconds)
+            # Reply body: [reply_status(2 bytes), volume_level(1 byte)]
+            # e.g. b'\x00\x00\x0f' means status=0 (success), volume=15
+            return body[-1] if len(body) >= 1 else 0
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Timeout waiting for GET_VOLUME reply") from exc
+        finally:
+            remove_handler()
+
+    async def set_scan(self, enabled: bool) -> None:
+        """Toggle scan using dedicated SET_IN_SCAN command"""
+        # Build raw message: group=BASIC(2), is_reply=0, command=SET_IN_SCAN(16), body=[enabled]
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.SET_IN_SCAN,
+            body=bytes([1 if enabled else 0])
+        )
+        raw = msg.to_bytes()
+        logger.debug("[SET_IN_SCAN] enabled=%s, bytes=%s", enabled, raw.hex())
+        await self._link.send_bytes(raw)
+
+    async def set_power_on_off(self, on: bool) -> None:
+        """Power the radio HT on or off using SET_HT_ON_OFF command (21)"""
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.SET_HT_ON_OFF,
+            body=bytes([1 if on else 0])
+        )
+        await self._link.send_bytes(msg.to_bytes())
+
+    async def fm_radio_set_mode(self, mode: int) -> None:
+        """Set FM broadcast radio mode (0=off, 1=on) using RADIO_SET_MODE (25)"""
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.RADIO_SET_MODE,
+            body=bytes([mode])
+        )
+        await self._link.send_bytes(msg.to_bytes())
+
+    async def fm_radio_seek_up(self) -> None:
+        """Seek up on FM band using RADIO_SEEK_UP (26)"""
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.RADIO_SEEK_UP,
+            body=b''
+        )
+        await self._link.send_bytes(msg.to_bytes())
+
+    async def fm_radio_seek_down(self) -> None:
+        """Seek down on FM band using RADIO_SEEK_DOWN (27)"""
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.RADIO_SEEK_DOWN,
+            body=b''
+        )
+        await self._link.send_bytes(msg.to_bytes())
+
+    async def fm_radio_set_freq(self, freq_khz: int) -> None:
+        """Set FM radio frequency in kHz using RADIO_SET_FREQ (28)"""
+        # Frequency is sent as 2 bytes big-endian (in units of 10kHz)
+        freq_unit = freq_khz // 10
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.RADIO_SET_FREQ,
+            body=freq_unit.to_bytes(2, 'big')
+        )
+        await self._link.send_bytes(msg.to_bytes())
+
+    async def play_tone(self, tone_id: int) -> None:
+        """Play a tone on the radio using PLAY_TONE (53)"""
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.PLAY_TONE,
+            body=bytes([tone_id])
+        )
+        await self._link.send_bytes(msg.to_bytes())
+
+    async def stop_ringing(self) -> None:
+        """Stop ringing/alert tone using STOP_RINGING (41)"""
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.STOP_RINGING,
+            body=b''
+        )
+        await self._link.send_bytes(msg.to_bytes())
+
+    async def set_time(self, timestamp: int) -> None:
+        """Set radio clock using SET_TIME (70). timestamp is Unix epoch seconds."""
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.SET_TIME,
+            body=timestamp.to_bytes(4, 'big')
+        )
+        await self._link.send_bytes(msg.to_bytes())
 
     async def send_message(self, command: CommandMessage) -> None:
         await self._link.send(command_message_to_protocol(command))
@@ -206,6 +358,7 @@ class CommandConnection:
 
     async def set_settings(self, settings: Settings) -> None:
         """Set the settings"""
+
         # Build the full WRITE_SETTINGS message, then truncate the settings
         # body to match the size the radio reported on READ_SETTINGS.
         # This radio firmware (v126) sends 20 bytes (160 bits) of settings on
@@ -218,6 +371,12 @@ class CommandConnection:
         target_size = self._settings_body_size
         # 4-byte message header + target_size settings bytes
         trimmed = full_bytes[:4 + target_size]
+
+        logger.debug(
+            "[SET_SETTINGS] scan=%s, full_bytes=%s, trimmed(%d+%d)=%s",
+            settings.scan, full_bytes.hex(), 4, target_size, trimmed.hex()
+        )
+
         queue: asyncio.Queue[SetSettingsReply | MessageReplyError] = asyncio.Queue()
 
         def reply_handler(reply: RadioMessage):
@@ -232,6 +391,39 @@ class CommandConnection:
             out = await asyncio.wait_for(queue.get(), timeout=self._reply_timeout_seconds)
         except asyncio.TimeoutError as exc:
             raise TimeoutError("Timeout waiting for SetSettingsReply reply") from exc
+        finally:
+            remove_handler()
+
+        if isinstance(out, MessageReplyError):
+            raise out.as_exception()
+
+        # Verify: read settings back to confirm radio accepted the change
+        try:
+            readback = await self.get_settings()
+            logger.debug(
+                "[SET_SETTINGS] READBACK scan=%s (expected %s)",
+                readback.scan, settings.scan
+            )
+        except Exception as e:
+            logger.debug("[SET_SETTINGS] READBACK failed: %s", e)
+
+    async def set_region(self, region_id: int) -> None:
+        """Set the active region (memory bank)"""
+        queue: asyncio.Queue[SetRegionReply | MessageReplyError] = asyncio.Queue()
+
+        def reply_handler(reply: RadioMessage):
+            if isinstance(reply, SetRegionReply) or (
+                isinstance(reply, MessageReplyError) and reply.message_type is SetRegionReply
+            ):
+                queue.put_nowait(reply)
+
+        remove_handler = self._add_message_handler(reply_handler)
+        try:
+            msg = command_message_to_protocol(SetRegion(region_id))
+            await self._link.send_bytes(msg.to_bytes())
+            out = await asyncio.wait_for(queue.get(), timeout=self._reply_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Timeout waiting for SetRegionReply reply") from exc
         finally:
             remove_handler()
 
@@ -336,6 +528,15 @@ def command_message_to_protocol(m: CommandMessage) -> p.Message:
                 command=p.BasicCommand.WRITE_SETTINGS,
                 body=p.WriteSettingsBody(
                     settings=settings.to_protocol()
+                )
+            )
+        case SetRegion(region_id):
+            return p.Message(
+                command_group=p.CommandGroup.BASIC,
+                is_reply=False,
+                command=p.BasicCommand.SET_REGION,
+                body=p.SetRegionBody(
+                    region_id=region_id
                 )
             )
         case GetDeviceInfo():
@@ -539,6 +740,15 @@ def radio_message_from_protocol(mf: p.Message) -> RadioMessage:
                     reason=reply_status.name,
                 )
             return SetSettingsReply()
+        case p.SetRegionReplyBody(
+            reply_status=reply_status,
+        ):
+            if reply_status != p.ReplyStatus.SUCCESS:
+                return MessageReplyError(
+                    message_type=SetRegionReply,
+                    reason=reply_status.name,
+                )
+            return SetRegionReply()
         case p.GetDevInfoReplyBody(
             reply_status=reply_status,
             dev_info=dev_info
@@ -590,6 +800,10 @@ class SetBeaconSettings(t.NamedTuple):
 
 class SetSettings(t.NamedTuple):
     settings: Settings
+
+
+class SetRegion(t.NamedTuple):
+    region_id: int
 
 
 class GetBatteryLevelAsPercentage(t.NamedTuple):
@@ -648,6 +862,7 @@ CommandMessage = t.Union[
     SetChannel,
     GetSettings,
     SetSettings,
+    SetRegion,
     SendTncDataFragment,
     EnableEvent,
     GetStatus,
@@ -671,6 +886,10 @@ class SetBeaconSettingsReply(t.NamedTuple):
 
 
 class SetSettingsReply(t.NamedTuple):
+    pass
+
+
+class SetRegionReply(t.NamedTuple):
     pass
 
 
@@ -746,6 +965,7 @@ ReplyMessage = t.Union[
     SetChannelReply,
     GetSettingsReply,
     SetSettingsReply,
+    SetRegionReply,
     SendTncDataFragmentReply,
     GetStatusReply,
     GetPositionReply,

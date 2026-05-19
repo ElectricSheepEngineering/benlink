@@ -149,8 +149,9 @@ from __future__ import annotations
 from typing_extensions import Unpack
 from dataclasses import dataclass
 import typing as t
-import sys
+import logging
 
+from . import protocol as p
 from .command import (
     CommandConnection,
     EventHandler,
@@ -172,6 +173,9 @@ from .command import (
     Status,
     Position,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -246,6 +250,43 @@ class RadioController:
 
         self._state.settings = new_settings
 
+        # Poll status multiple times after scan toggle to catch transient states
+        if 'scan' in settings_args:
+            import asyncio
+            for delay in (0.2, 0.5, 1.0, 2.0):
+                await asyncio.sleep(delay)
+                status = await self._conn.get_status()
+                logger.debug(
+                    "[SET_SETTINGS] t+%.1fs status: is_scan=%s, "
+                    "is_power_on=%s, is_radio=%s, double_channel=%s, "
+                    "curr_ch_id=%s, is_rx=%s, is_sq=%s",
+                    delay, status.is_scan,
+                    status.is_power_on, status.is_radio,
+                    status.double_channel, status.curr_ch_id,
+                    status.is_in_rx, status.is_sq
+                )
+                self._state.status = status
+                if status.is_scan:
+                    break  # Scan started, no need to poll more
+
+    async def set_region(self, region_id: int) -> None:
+        """Switch the active region (memory bank) and reload channels."""
+        if self._state is None:
+            raise StateNotInitializedError()
+
+        await self._conn.set_region(region_id)
+
+        # Reload channels from the new region
+        channels: t.List[Channel] = []
+        for i in range(self._state.device_info.channel_count):
+            try:
+                ch = await self._conn.get_channel(i)
+                channels.append(ch)
+            except Exception:
+                break
+
+        self._state.channels = channels
+
     @property
     def device_info(self) -> DeviceInfo:
         if self._state is None:
@@ -278,6 +319,50 @@ class RadioController:
     async def send_bytes(self, command: bytes) -> None:
         """For debugging - Use at your own risk!"""
         await self._conn.send_bytes(command)
+
+    async def set_volume(self, level: int) -> None:
+        """Set hardware volume (0-15) using dedicated SET_VOLUME command."""
+        await self._conn.set_volume(level)
+
+    async def get_volume(self) -> int:
+        """Get hardware volume (0-15) using dedicated GET_VOLUME command."""
+        return await self._conn.get_volume()
+
+    async def set_scan(self, enabled: bool) -> None:
+        """Toggle scan using dedicated SET_IN_SCAN command."""
+        await self._conn.set_scan(enabled)
+
+    async def set_power(self, on: bool) -> None:
+        """Power the radio HT on or off."""
+        await self._conn.set_power_on_off(on)
+
+    async def fm_radio_set_mode(self, mode: int) -> None:
+        """Set FM broadcast radio mode (0=off, 1=on)."""
+        await self._conn.fm_radio_set_mode(mode)
+
+    async def fm_radio_seek_up(self) -> None:
+        """Seek up on FM broadcast band."""
+        await self._conn.fm_radio_seek_up()
+
+    async def fm_radio_seek_down(self) -> None:
+        """Seek down on FM broadcast band."""
+        await self._conn.fm_radio_seek_down()
+
+    async def fm_radio_set_freq(self, freq_khz: int) -> None:
+        """Set FM broadcast radio frequency in kHz (e.g. 101500 for 101.5 MHz)."""
+        await self._conn.fm_radio_set_freq(freq_khz)
+
+    async def play_tone(self, tone_id: int) -> None:
+        """Play a tone on the radio."""
+        await self._conn.play_tone(tone_id)
+
+    async def stop_ringing(self) -> None:
+        """Stop any ringing/alert tone."""
+        await self._conn.stop_ringing()
+
+    async def set_time(self, timestamp: int) -> None:
+        """Set radio clock (Unix epoch seconds)."""
+        await self._conn.set_time(timestamp)
 
     async def battery_voltage(self) -> float:
         return await self._conn.get_battery_voltage()
@@ -315,9 +400,21 @@ class RadioController:
 
         channels: t.List[Channel] = []
 
-        total_channels = device_info.channel_count * max(device_info.region_count, 1)
+        total_channels = device_info.channel_count
         for i in range(total_channels):
-            channel_settings = await self._conn.get_channel(i)
+            try:
+                channel_settings = await self._conn.get_channel(i)
+            except ValueError:
+                # Radio rejected this channel index (INVALID_PARAMETER).
+                # Some radios/firmware versions don't support the full
+                # advertised channel range. Stop reading and continue
+                # with what we have.
+                logger.warning(
+                    "get_channel(%d) failed, stopping at %d channels "
+                    "(radio advertised %d)",
+                    i, len(channels), total_channels
+                )
+                break
             channels.append(channel_settings)
 
         settings = await self._conn.get_settings()
@@ -365,10 +462,16 @@ class RadioController:
             case StatusChangedEvent(status):
                 self._state.status = status
             case UnknownProtocolMessage(message):
-                print(
-                    f"[DEBUG] Unknown protocol message: {message}",
-                    file=sys.stderr
-                )
+                # Suppress noisy debug for known unsolicited messages
+                if (message.command_group == p.CommandGroup.EXTENDED or
+                    message.command in (
+                        p.BasicCommand.GET_VOLUME,
+                        p.BasicCommand.SET_VOLUME,
+                        p.BasicCommand.SET_IN_SCAN,
+                    )):
+                    pass  # Handled by dedicated handlers or benign
+                else:
+                    logger.debug("Unknown protocol message: %s", message)
 
     # Async Context Manager
     async def __aenter__(self):
