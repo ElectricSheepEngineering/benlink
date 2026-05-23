@@ -87,6 +87,7 @@ class CommandConnection:
 
     async def set_volume(self, level: int) -> None:
         """Set hardware volume using dedicated SET_VOLUME command (0-15)"""
+        import asyncio
         if level < 0 or level > 15:
             raise ValueError(f"Volume level must be 0-15, got {level}")
         # Build raw message: group=BASIC(2), is_reply=0, command=SET_VOLUME(23), body=[level]
@@ -98,7 +99,29 @@ class CommandConnection:
         )
         raw = msg.to_bytes()
         logger.debug("[SET_VOLUME] level=%d, bytes=%s", level, raw.hex())
-        await self._link.send_bytes(raw)
+
+        # Wait for the reply ACK (radio sends a reply with is_reply=True)
+        reply_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        def raw_handler(reply: RadioMessage):
+            if isinstance(reply, UnknownProtocolMessage):
+                proto_msg = reply.message
+                if (proto_msg.command_group == p.CommandGroup.BASIC and
+                    proto_msg.is_reply and
+                    proto_msg.command == p.BasicCommand.SET_VOLUME):
+                    body = proto_msg.body
+                    if isinstance(body, bytes):
+                        reply_queue.put_nowait(body)
+
+        remove_handler = self._add_message_handler(raw_handler)
+        try:
+            await self._link.send_bytes(raw)
+            await asyncio.wait_for(reply_queue.get(), timeout=self._reply_timeout_seconds)
+            logger.debug("[SET_VOLUME] ACK received for level=%d", level)
+        except asyncio.TimeoutError:
+            logger.warning("[SET_VOLUME] Timeout waiting for ACK (level=%d)", level)
+        finally:
+            remove_handler()
 
     async def get_volume(self) -> int:
         """Get hardware volume using dedicated GET_VOLUME command (returns 0-15)"""
@@ -131,9 +154,17 @@ class CommandConnection:
         try:
             await self._link.send_bytes(raw)
             body = await asyncio.wait_for(reply_queue.get(), timeout=self._reply_timeout_seconds)
-            # Reply body: [reply_status(2 bytes), volume_level(1 byte)]
-            # e.g. b'\x00\x00\x0f' means status=0 (success), volume=15
-            return body[-1] if len(body) >= 1 else 0
+            # Reply body: [reply_status(1 byte), volume_level(1 byte)]
+            # HTCommander reads value[5] which is body index 1 (after 4-byte header + 1 status byte)
+            logger.debug("[GET_VOLUME] reply body=%s (hex=%s, len=%d)", list(body), body.hex(), len(body))
+            if len(body) >= 2:
+                vol = body[1]
+            elif len(body) == 1:
+                vol = body[0]
+            else:
+                vol = 0
+            logger.debug("[GET_VOLUME] parsed volume=%d", vol)
+            return vol
         except asyncio.TimeoutError as exc:
             raise TimeoutError("Timeout waiting for GET_VOLUME reply") from exc
         finally:
@@ -300,6 +331,83 @@ class CommandConnection:
         reply = await self.send_message_expect_reply(SendTncDataFragment(tnc_data_fragment), SendTncDataFragmentReply)
         if isinstance(reply, MessageReplyError):
             raise reply.as_exception()
+
+    async def get_aprs_path(self) -> str:
+        """Get the APRS digipeater path from the radio (e.g. 'WIDE1-1,WIDE2-1').
+        Uses GET_APRS_PATH command (72). Returns empty string if not set."""
+        import asyncio
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.GET_APRS_PATH,
+            body=b''
+        )
+        raw = msg.to_bytes()
+
+        reply_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        def raw_handler(reply: RadioMessage):
+            if isinstance(reply, UnknownProtocolMessage):
+                proto_msg = reply.message
+                if (proto_msg.command_group == p.CommandGroup.BASIC and
+                    proto_msg.is_reply and
+                    proto_msg.command == p.BasicCommand.GET_APRS_PATH):
+                    body = proto_msg.body
+                    if isinstance(body, bytes):
+                        reply_queue.put_nowait(body)
+
+        remove_handler = self._add_message_handler(raw_handler)
+        try:
+            await self._link.send_bytes(raw)
+            body = await asyncio.wait_for(reply_queue.get(), timeout=self._reply_timeout_seconds)
+            # Reply body: [status(1 byte), path_string...]
+            # Strip status byte and null terminators
+            if len(body) > 1:
+                path_bytes = body[1:]
+            else:
+                path_bytes = b''
+            return path_bytes.rstrip(b'\x00').decode('ascii', errors='replace').strip()
+        except asyncio.TimeoutError:
+            logger.warning("[GET_APRS_PATH] Timeout waiting for reply")
+            return ""
+        finally:
+            remove_handler()
+
+    async def set_aprs_path(self, path: str) -> None:
+        """Set the APRS digipeater path on the radio (e.g. 'WIDE1-1,WIDE2-1').
+        Uses SET_APRS_PATH command (71)."""
+        import asyncio
+        # Body is the path string, null-terminated
+        data = path.encode('ascii') + b'\x00'
+        msg = p.Message(
+            command_group=p.CommandGroup.BASIC,
+            is_reply=False,
+            command=p.BasicCommand.SET_APRS_PATH,
+            body=data
+        )
+        raw = msg.to_bytes()
+
+        reply_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        def raw_handler(reply: RadioMessage):
+            if isinstance(reply, UnknownProtocolMessage):
+                proto_msg = reply.message
+                if (proto_msg.command_group == p.CommandGroup.BASIC and
+                    proto_msg.is_reply and
+                    proto_msg.command == p.BasicCommand.SET_APRS_PATH):
+                    body = proto_msg.body
+                    if isinstance(body, bytes):
+                        reply_queue.put_nowait(body)
+
+        remove_handler = self._add_message_handler(raw_handler)
+        try:
+            await self._link.send_bytes(raw)
+            await asyncio.wait_for(reply_queue.get(), timeout=self._reply_timeout_seconds)
+            logger.debug("[SET_APRS_PATH] ACK received for path='%s'", path)
+        except asyncio.TimeoutError:
+            logger.warning("[SET_APRS_PATH] Timeout waiting for ACK (path='%s')", path)
+        finally:
+            remove_handler()
 
     async def get_beacon_settings(self) -> BeaconSettings:
         """Get the current packet settings"""

@@ -379,15 +379,29 @@ class RadioController:
     async def position(self) -> Position:
         return await self._conn.get_position()
 
-    async def send_tnc_data(self, data: bytes) -> None:
-        if len(data) > 50:
-            raise ValueError("Data too long -- TODO: implement fragmentation")
+    async def get_aprs_path(self) -> str:
+        """Get the APRS digipeater path from the radio (e.g. 'WIDE1-1,WIDE2-1')."""
+        return await self._conn.get_aprs_path()
 
-        await self._conn.send_tnc_data_fragment(TncDataFragment(
-            is_final_fragment=True,
-            fragment_id=0,
-            data=data
-        ))
+    async def set_aprs_path(self, path: str) -> None:
+        """Set the APRS digipeater path on the radio (e.g. 'WIDE1-1,WIDE2-1')."""
+        await self._conn.set_aprs_path(path)
+
+    async def send_tnc_data(self, data: bytes, channel_id: int | None = None) -> None:
+        MAX_FRAGMENT_SIZE = 50  # Matches HTCommander's MAX_MTU for BLE
+        offset = 0
+        fragment_id = 0
+        while offset < len(data):
+            chunk = data[offset:offset + MAX_FRAGMENT_SIZE]
+            is_last = (offset + len(chunk)) >= len(data)
+            await self._conn.send_tnc_data_fragment(TncDataFragment(
+                is_final_fragment=is_last,
+                fragment_id=fragment_id & 0x3F,  # 6-bit field
+                data=chunk,
+                channel_id=channel_id
+            ))
+            offset += len(chunk)
+            fragment_id += 1
 
     def add_event_handler(self, handler: EventHandler) -> t.Callable[[], None]:
         return self._conn.add_event_handler(handler)
