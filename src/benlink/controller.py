@@ -195,6 +195,11 @@ class RadioController:
         self._conn = connection
         self._state = None
 
+    @property
+    def ble_write_lock(self):
+        """The asyncio.Lock held during BLE GATT writes, or None if not BLE."""
+        return self._conn.ble_write_lock
+
     @classmethod
     def new_ble(cls, device_uuid: str) -> RadioController:
         return RadioController(CommandConnection.new_ble(device_uuid))
@@ -246,28 +251,17 @@ class RadioController:
             update=dict(settings_args)
         )
 
+        # The `scan` bit is part of the settings bitfield but should only be
+        # changed intentionally via SET_IN_SCAN. If we're not explicitly
+        # setting scan, sync it from the current radio status to avoid
+        # accidentally re-enabling/disabling scan when writing other fields.
+        if 'scan' not in settings_args:
+            current_scan = self._state.status.is_scan if self._state else False
+            new_settings = new_settings.model_copy(update={'scan': current_scan})
+
         await self._conn.set_settings(new_settings)
 
         self._state.settings = new_settings
-
-        # Poll status multiple times after scan toggle to catch transient states
-        if 'scan' in settings_args:
-            import asyncio
-            for delay in (0.2, 0.5, 1.0, 2.0):
-                await asyncio.sleep(delay)
-                status = await self._conn.get_status()
-                logger.debug(
-                    "[SET_SETTINGS] t+%.1fs status: is_scan=%s, "
-                    "is_power_on=%s, is_radio=%s, double_channel=%s, "
-                    "curr_ch_id=%s, is_rx=%s, is_sq=%s",
-                    delay, status.is_scan,
-                    status.is_power_on, status.is_radio,
-                    status.double_channel, status.curr_ch_id,
-                    status.is_in_rx, status.is_sq
-                )
-                self._state.status = status
-                if status.is_scan:
-                    break  # Scan started, no need to poll more
 
     async def set_region(self, region_id: int) -> None:
         """Switch the active region (memory bank) and reload channels."""

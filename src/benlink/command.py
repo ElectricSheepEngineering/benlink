@@ -61,8 +61,16 @@ class CommandConnection:
     def __init__(self, link: CommandLink):
         self._link = link
         self._handlers = []
-        self._reply_timeout_seconds = 60.0
+        self._reply_timeout_seconds = 10.0
         self._settings_body_size: int = 20  # bytes; updated from READ_SETTINGS reply
+
+    @property
+    def ble_write_lock(self) -> asyncio.Lock | None:
+        """Return the BLE write lock if the underlying link is a BleCommandLink."""
+        from .link import BleCommandLink
+        if isinstance(self._link, BleCommandLink):
+            return self._link.write_lock
+        return None
 
     @classmethod
     def new_ble(cls, device_uuid: str) -> CommandConnection:
@@ -504,16 +512,6 @@ class CommandConnection:
 
         if isinstance(out, MessageReplyError):
             raise out.as_exception()
-
-        # Verify: read settings back to confirm radio accepted the change
-        try:
-            readback = await self.get_settings()
-            logger.debug(
-                "[SET_SETTINGS] READBACK scan=%s (expected %s)",
-                readback.scan, settings.scan
-            )
-        except Exception as e:
-            logger.debug("[SET_SETTINGS] READBACK failed: %s", e)
 
     async def set_region(self, region_id: int) -> None:
         """Set the active region (memory bank)"""

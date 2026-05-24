@@ -8,6 +8,30 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from . import protocol as p
 from .protocol.command.bitfield import BitStream
 
+# ── Monkey-patch bleak's CoreBluetooth delegate to guard against
+#    InvalidStateError when a write-completion callback fires late
+#    (after the future has already been cancelled/timed out).
+if sys.platform == "darwin":
+    try:
+        from bleak.backends.corebluetooth.PeripheralDelegate import (
+            PeripheralDelegate,
+        )
+
+        _original_did_write = (
+            PeripheralDelegate.did_write_value_for_characteristic
+        )
+
+        def _safe_did_write(self, peripheral, characteristic, error):
+            try:
+                _original_did_write(self, peripheral, characteristic, error)
+            except (asyncio.InvalidStateError, Exception):
+                # Future was already done (timed out / cancelled) — ignore
+                pass
+
+        PeripheralDelegate.did_write_value_for_characteristic = _safe_did_write
+    except (ImportError, AttributeError):
+        pass  # Non-CoreBluetooth platform or incompatible bleak version
+
 ##################################################
 # CommandLink
 
@@ -42,6 +66,18 @@ RADIO_INDICATE_UUID = "00001102-d102-11e1-9b23-00025b00a5a5"
 class BleCommandLink:
     _client: BleakClient
     _buffer: BitStream
+    _write_lock: asyncio.Lock
+
+    # Timeout for individual BLE GATT write operations (seconds).
+    # CoreBluetooth on macOS can silently drop write-completion callbacks
+    # under load, causing write_gatt_char to hang forever.
+    WRITE_TIMEOUT: float = 5.0
+
+    # Number of retries for transient write failures
+    WRITE_RETRIES: int = 2
+
+    # Minimum inter-write delay (seconds) to let CoreBluetooth settle
+    WRITE_SPACING: float = 0.02
 
     def is_connected(self) -> bool:
         return self._client.is_connected
@@ -49,12 +85,47 @@ class BleCommandLink:
     def __init__(self, device_uuid: str):
         self._client = BleakClient(device_uuid)
         self._buffer = BitStream()
+        self._write_lock = asyncio.Lock()
+
+    @property
+    def write_lock(self) -> asyncio.Lock:
+        """Lock held during BLE GATT writes. External code (e.g. RFCOMM pump)
+        can check this to avoid processing the NSRunLoop while a write is
+        in flight, preventing CoreBluetooth callback races."""
+        return self._write_lock
 
     async def send(self, msg: p.Message):
         await self.send_bytes(msg.to_bytes())
 
     async def send_bytes(self, data: bytes):
-        await self._client.write_gatt_char(RADIO_WRITE_UUID, data, response=True)
+        async with self._write_lock:
+            last_exc: Exception | None = None
+            for attempt in range(1 + self.WRITE_RETRIES):
+                try:
+                    await asyncio.wait_for(
+                        self._client.write_gatt_char(
+                            RADIO_WRITE_UUID, data, response=True
+                        ),
+                        timeout=self.WRITE_TIMEOUT,
+                    )
+                    # Small delay between writes to avoid overwhelming
+                    # CoreBluetooth's callback dispatch
+                    await asyncio.sleep(self.WRITE_SPACING)
+                    return
+                except asyncio.TimeoutError:
+                    last_exc = TimeoutError(
+                        f"BLE write timed out after {self.WRITE_TIMEOUT}s "
+                        f"(attempt {attempt + 1}/{1 + self.WRITE_RETRIES})"
+                    )
+                    # Brief pause before retry
+                    await asyncio.sleep(0.1)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < self.WRITE_RETRIES:
+                        await asyncio.sleep(0.1)
+                    else:
+                        break
+            raise last_exc or RuntimeError("BLE write failed")
 
     async def connect(self, callback: t.Callable[[p.Message], None]):
         await self._client.connect()
