@@ -150,6 +150,7 @@ from typing_extensions import Unpack
 from dataclasses import dataclass
 import typing as t
 import logging
+import asyncio
 
 from . import protocol as p
 from .command import (
@@ -227,7 +228,10 @@ class RadioController:
             update=dict(packet_settings_args)
         )
 
-        await self._conn.set_beacon_settings(new_beacon_settings)
+        await self._conn.set_beacon_settings(
+            new_beacon_settings,
+            firmware_version=self._state.device_info.firmware_version,
+        )
 
         self._state.beacon_settings = new_beacon_settings
 
@@ -383,17 +387,37 @@ class RadioController:
 
     async def send_tnc_data(self, data: bytes, channel_id: int | None = None) -> None:
         MAX_FRAGMENT_SIZE = 50  # Matches HTCommander's MAX_MTU for BLE
+        MAX_RETRIES = 5
+        RETRY_DELAY = 0.3  # seconds
+
         offset = 0
         fragment_id = 0
         while offset < len(data):
             chunk = data[offset:offset + MAX_FRAGMENT_SIZE]
             is_last = (offset + len(chunk)) >= len(data)
-            await self._conn.send_tnc_data_fragment(TncDataFragment(
+            fragment = TncDataFragment(
                 is_final_fragment=is_last,
                 fragment_id=fragment_id & 0x3F,  # 6-bit field
                 data=chunk,
                 channel_id=channel_id
-            ))
+            )
+
+            # Retry on INCORRECT_STATE (radio busy / channel not free)
+            last_err: Exception | None = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    await self._conn.send_tnc_data_fragment(fragment)
+                    last_err = None
+                    break
+                except Exception as exc:
+                    if "INCORRECT_STATE" in str(exc) and attempt < MAX_RETRIES - 1:
+                        last_err = exc
+                        await asyncio.sleep(RETRY_DELAY)
+                    else:
+                        raise
+            if last_err is not None:
+                raise last_err
+
             offset += len(chunk)
             fragment_id += 1
 

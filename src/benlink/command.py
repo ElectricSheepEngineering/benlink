@@ -424,9 +424,9 @@ class CommandConnection:
             raise reply.as_exception()
         return reply.tnc_settings
 
-    async def set_beacon_settings(self, packet_settings: BeaconSettings):
+    async def set_beacon_settings(self, packet_settings: BeaconSettings, firmware_version: int = 136):
         """Set the packet settings"""
-        reply = await self.send_message_expect_reply(SetBeaconSettings(packet_settings), SetBeaconSettingsReply)
+        reply = await self.send_message_expect_reply(SetBeaconSettings(packet_settings, firmware_version), SetBeaconSettingsReply)
         if isinstance(reply, MessageReplyError):
             raise reply.as_exception()
 
@@ -611,13 +611,13 @@ def command_message_to_protocol(m: CommandMessage) -> p.Message:
                 command=p.BasicCommand.READ_BSS_SETTINGS,
                 body=p.ReadBSSSettingsBody()
             )
-        case SetBeaconSettings(packet_settings):
+        case SetBeaconSettings(packet_settings, fw_ver):
             return p.Message(
                 command_group=p.CommandGroup.BASIC,
                 is_reply=False,
                 command=p.BasicCommand.WRITE_BSS_SETTINGS,
                 body=p.WriteBSSSettingsBody(
-                    bss_settings=packet_settings.to_protocol()
+                    bss_settings=packet_settings.to_protocol(fw_ver)
                 )
             )
         case GetSettings():
@@ -902,6 +902,7 @@ class GetBeaconSettings(t.NamedTuple):
 
 class SetBeaconSettings(t.NamedTuple):
     tnc_settings: BeaconSettings
+    firmware_version: int = 136
 
 
 class SetSettings(t.NamedTuple):
@@ -1699,9 +1700,15 @@ class BeaconSettings(ImmutableBaseModel):
             aprs_callsign=bs.aprs_callsign
         )
 
-    def to_protocol(self) -> p.BSSSettingsV2:
-        """@private (Protocol helper)"""
-        return p.BSSSettingsV2(
+    def to_protocol(self, firmware_version: int = 136) -> p.BSSSettingsV2 | p.BSSSettings:
+        """@private (Protocol helper)
+        
+        Uses firmware_version to decide the write format:
+          soft_ver < 50  -> 46 bytes (not supported here, uses BSSSettings)
+          50 <= soft_ver < 136 -> BSSSettings (50 bytes)
+          soft_ver >= 136 -> BSSSettingsV2 (52 bytes)
+        """
+        common = dict(
             max_fwd_times=self.max_fwd_times,
             time_to_live=self.time_to_live,
             ptt_release_send_location=self.ptt_release_send_location,
@@ -1724,6 +1731,9 @@ class BeaconSettings(ImmutableBaseModel):
                 self.bss_user_id
             ),
         )
+        if firmware_version >= 136:
+            return p.BSSSettingsV2(**common)
+        return p.BSSSettings(**common)
 
 
 ChannelType = t.Literal["OFF", "A", "B"]
